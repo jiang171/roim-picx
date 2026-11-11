@@ -164,6 +164,8 @@ sequenceDiagram
 
 ## 🚀 部署教程
 
+> **部署备注**：R2 / KV / D1 的绑定名请分别填写 `PICX` / `XK` / `DB`，与代码中的 Env 保持一致。
+
 ### 1️⃣ Fork 项目
 
 将本项目 Fork 到自己的 GitHub 账户
