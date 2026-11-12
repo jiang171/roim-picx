@@ -3,6 +3,7 @@ import { Ok, Fail, FailCode } from '../type'
 import StatusCode from '../type'
 import type { User, DbUser, UserStats } from '../type'
 import { auth, type AppEnv, isAdminUser, adminAuth } from '../middleware/auth'
+import { getResourceLimits } from '../services/ResourceService'
 
 const adminRoutes = new Hono<AppEnv>()
 
@@ -576,23 +577,25 @@ adminRoutes.post('/sync-r2-to-d1', auth, adminAuth, async (c) => {
 
     try {
         const body = await c.req.json().catch(() => ({}))
-        limit = parseInt(body.limit || '100')
+        const limits = c.get('resourceLimits') || await getResourceLimits(c.env.DB)
+        limit = Math.min(limits.maxBatchFiles, Math.max(1, parseInt(body.limit || '5') || 5))
         cursor = body.cursor || undefined
         dryRun = body.dryRun === true
 
         // 1. 获取 R2 文件列表 (包含元数据)
-        const list = await c.env.PICX.list({
+        const listOptions: Parameters<typeof c.env.PICX.list>[0] & { include: string[] } = {
             limit,
             cursor,
             include: ['customMetadata', 'httpMetadata']
-        })
+        }
+        const list = await c.env.PICX.list(listOptions)
 
         const results = {
             processed: 0,
             synced: 0,
             skipped: 0,
             errors: 0,
-            nextCursor: list.cursor,
+            nextCursor: list.truncated ? list.cursor : undefined,
             hasMore: list.truncated,
             details: [] as any[]
         }

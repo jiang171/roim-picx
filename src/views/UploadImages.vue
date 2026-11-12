@@ -77,7 +77,7 @@ import UploadZone from '../components/upload/UploadZone.vue'
 import UploadStats from '../components/upload/UploadStats.vue'
 import formatBytes from '../utils/format-bytes'
 import { ElNotification as elNotify } from 'element-plus'
-import { requestUploadImages, requestListImages, requestAuthConfig, requestListAlbums, type StorageProvider } from '../utils/request'
+import { requestUploadImages, requestListImages, requestAuthConfig, requestListAlbums, requestResourceConfig, type StorageProvider } from '../utils/request'
 import { useRouter } from 'vue-router'
 import ResultList from '../components/ResultList.vue'
 import type { ConvertedImage, ImgItem, ImgReq, Album } from '../utils/types'
@@ -100,7 +100,7 @@ const imagesTotalSize = computed(() =>
     convertedImages.value.reduce((total, item) => total + item.file.size, 0)
 )
 
-const imageSizeLimit = 20 * 1024 * 1024
+const imageSizeLimit = ref(20 * 1024 * 1024)
 const input = ref<HTMLInputElement>()
 const loading = ref(false)
 const router = useRouter()
@@ -317,7 +317,7 @@ const appendConvertedImages = async (files: FileList | null | undefined) => {
     for (let i = 0; i < files.length; i++) {
         const file = files.item(i)
         if (!file) continue
-        if (file.size > imageSizeLimit) {
+        if (file.size > imageSizeLimit.value) {
             elNotify({
                 message: t('upload.fileTooLarge', { name: file.name }),
                 type: 'error'
@@ -434,28 +434,44 @@ const uploadImages = () => {
     for (let item of convertedImages.value) {
         formData.append('files', item.file)
         formData.append('nsfw', item.nsfw ? 'true' : 'false')
-        if (item.nsfwScore) {
-            formData.append('nsfwScore', item.nsfwScore.toString())
-        }
+        formData.append('nsfwScore', (item.nsfwScore || 0).toString())
     }
 
     requestUploadImages(formData)
         .then((res) => {
             elNotify({
                 title: t('upload.uploadComplete'),
-                message: t('upload.uploadCompleteMsg', { count: convertedImages.value.length, size: formatBytes(imagesTotalSize.value) }),
+                message: t('upload.uploadCompleteMsg', { count: res.length, size: formatBytes(res.reduce((sum, item) => sum + item.size, 0)) }),
                 type: 'success'
             })
-            convertedImages.value = []
+            removeUploadedFiles(res)
             imgResultList.value = res
             // console.log(res)
             // router.push('/')
         })
-        .catch(() => { })
+        .catch((error) => {
+            const completed = error?.partialResults || []
+            imgResultList.value = completed
+            removeUploadedFiles(completed)
+            elNotify({ message: `上传已停止，成功 ${completed.length} 张；剩余文件保留，可稍后重试。${error?.message || ''}`, type: 'warning', duration: 0 })
+        })
         .finally(() => {
             loading.value = false
         })
 }
+
+function removeUploadedFiles(results: ImgItem[]) {
+    const remaining = [...results]
+    for (const item of [...convertedImages.value]) {
+        const index = remaining.findIndex(result => result.filename === item.file.name && result.size === item.file.size)
+        if (index !== -1) { remaining.splice(index, 1); removeImage(item.tmpSrc) }
+    }
+}
+
+onMounted(async () => {
+    try { imageSizeLimit.value = (await requestResourceConfig()).maxFileBytes }
+    catch (e) { console.error('Failed to load upload bounds:', e) }
+})
 </script>
 
 <style scoped>

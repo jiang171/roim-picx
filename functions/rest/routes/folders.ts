@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { Ok, Fail, Folder } from '../type'
 import { auth, type AppEnv } from '../middleware/auth'
+import { reserveUpload, releaseUpload, resourceError } from '../services/ResourceService'
 
 const folderRoutes = new Hono<AppEnv>()
 
@@ -13,11 +14,16 @@ folderRoutes.post("/folder", auth, async (c) => {
         if (!data.name || !regx.test(data.name)) {
             return c.json(Fail("Folder name error: only letters, numbers, underscores, hyphens and Chinese allowed"))
         }
-        await c.env.PICX.put(data.name + '/', null)
+        const login = c.get('user')?.login
+        if (!login) return c.json(Fail('无法确认用户配额'))
+        // Folder markers use a Class A operation too, so charge the daily attempt budget.
+        await reserveUpload(c.env.DB, data.name + '/', login, 0, 'R2')
+        try { await c.env.PICX.put(data.name + '/', null) }
+        finally { await releaseUpload(c.env.DB, data.name + '/') }
         return c.json(Ok("Success"))
     } catch (e) {
         console.error('Create folder error:', e)
-        return c.json(Fail(`Create folder fail: ${(e as Error).message}`))
+        return c.json(Fail(`Create folder fail: ${resourceError(e)}`))
     }
 })
 

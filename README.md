@@ -166,6 +166,8 @@ sequenceDiagram
 
 > **部署备注**：R2 / KV / D1 的绑定名请分别填写 `PICX` / `XK` / `DB`，与代码中的 Env 保持一致。
 
+> **资源额度**：上传、存储和统计预算可在后台“系统设置 → 资源额度”调整；升级前请先执行所有数据库迁移。详见[资源额度说明](docs/resource-limits.md)。
+
 ### 1️⃣ Fork 项目
 
 将本项目 Fork 到自己的 GitHub 账户

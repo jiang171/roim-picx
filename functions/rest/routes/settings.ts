@@ -3,8 +3,46 @@ import { Hono } from 'hono'
 import { Ok, Fail } from '../type'
 import { auth, adminAuth, type AppEnv } from '../middleware/auth'
 import { ConfigService, type UploadConfigItem } from '../services/ConfigService'
+import { getResourceLimits, saveResourceLimits, getResourceUsage, cleanupResourceHistory, releaseUpload, drainDeletionTokens } from '../services/ResourceService'
+import { getProviderByType } from '../storage'
 
 const settingsRoutes = new Hono<AppEnv>()
+
+// Upload clients need these public bounds to split requests without changing the upload API.
+settingsRoutes.get('/resource-config', async (c) => {
+    const limits = c.get('resourceLimits') || await getResourceLimits(c.env.DB)
+    return c.json(Ok({ maxFileBytes: limits.maxFileBytes, maxBatchFiles: limits.maxBatchFiles,
+        maxBatchBytes: limits.maxBatchBytes, deletionLinksEnabled: limits.deletionLinksEnabled }))
+})
+
+settingsRoutes.get('/resources', auth, adminAuth, async (c) => {
+    return c.json(Ok({ limits: await getResourceLimits(c.env.DB), usage: await getResourceUsage(c.env.DB, c.get('user')?.login) }))
+})
+
+settingsRoutes.post('/resources', auth, adminAuth, async (c) => {
+    try { return c.json(Ok(await saveResourceLimits(c.env.DB, await c.req.json()))) }
+    catch (e) { return c.json(Fail((e as Error).message), 400) }
+})
+
+settingsRoutes.post('/resources/cleanup', auth, adminAuth, async (c) => {
+    await drainDeletionTokens(c.env.DB, c.env.XK)
+    return c.json(Ok(await cleanupResourceHistory(c.env.DB, await getResourceLimits(c.env.DB))))
+})
+
+settingsRoutes.post('/resources/reconcile', auth, adminAuth, async (c) => {
+    // Never automatically expire capacity: a timeout can leave a real, billable object behind.
+    const pending = await c.env.DB.prepare(`SELECT key, storage_type FROM resource_reservations
+        WHERE created_at < datetime('now', '-1 hour') ORDER BY created_at LIMIT 5`)
+        .all<{ key: string, storage_type: 'R2' | 'HF' }>()
+    let released = 0
+    for (const row of pending.results) {
+        if (!await getProviderByType(c, row.storage_type).head(row.key)) {
+            await releaseUpload(c.env.DB, row.key)
+            released++
+        }
+    }
+    return c.json(Ok({ checked: pending.results.length, released, retained: pending.results.length - released }))
+})
 
 /**
  * 获取上传配置

@@ -4,6 +4,9 @@ import type { KVNamespace, R2Bucket, D1Database } from '@cloudflare/workers-type
 import { FailCode, NotAuth, Fail, ApiKey } from '../type'
 import StatusCode from '../type'
 import type { User, DbUser } from '../type'
+import type { ResourceLimits } from '../../../shared/resource-limits'
+import { getResourceLimits } from '../services/ResourceService'
+import { takeMemoryBudget } from './resources'
 
 export type Bindings = {
     BASE_URL: string
@@ -27,6 +30,7 @@ export type Bindings = {
 }
 
 export type Variables = {
+    resourceLimits: ResourceLimits
     user?: User
     isAdminToken?: boolean  // 是否使用管理员 Token 登录
     isApiKey?: boolean // 是否使用 API Key 登录
@@ -283,11 +287,21 @@ export const auth = async (c: Context<AppEnv>, next: Next) => {
                 return c.json(FailCode('API Key has limited permissions. Only upload, list, and delete are allowed.', 403))
             }
 
-            // Update last_used_at
-            c.executionCtx.waitUntil(
-                c.env.DB.prepare('UPDATE api_keys SET last_used_at = ? WHERE id = ?')
-                    .bind(new Date().toISOString(), keyRecord.id).run()
-            )
+            const limits = c.get('resourceLimits') || await getResourceLimits(c.env.DB)
+            const retry = takeMemoryBudget(`api-key:${keyRecord.id}`, limits.apiRequestsPerMinute)
+            if (retry) {
+                c.header('Retry-After', String(retry))
+                return c.json(FailCode('API Key 请求过于频繁，请稍后重试', 429), 429)
+            }
+            const cutoff = new Date(Date.now() - limits.apiKeyTouchSeconds * 1000).toISOString()
+            if (!keyRecord.last_used_at || keyRecord.last_used_at < cutoff) {
+                c.executionCtx.waitUntil(
+                    c.env.DB.prepare(`UPDATE api_keys SET last_used_at = ? WHERE id = ?
+                        AND (last_used_at IS NULL OR last_used_at < ?)`)
+                        .bind(new Date().toISOString(), keyRecord.id, cutoff).run()
+                        .catch(e => console.error('API Key usage update failed:', e))
+                )
+            }
 
             await next()
             return

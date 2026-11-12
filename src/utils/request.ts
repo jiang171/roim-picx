@@ -7,6 +7,8 @@ import {
 	ApiKey
 } from "./types"
 import storage from "./storage"
+import { partitionFiles } from '../../shared/upload-batches'
+import type { ResourceLimits } from '../../shared/resource-limits'
 const request = axios.create({
 	baseURL: import.meta.env.VITE_APP_API_URL || '',
 	timeout: 200000
@@ -54,11 +56,12 @@ request.interceptors.response.use(
 			})
 			return Promise.reject(data.msg)
 		}
+		if (data.msg && data.msg !== 'ok') elNotify({ message: data.msg, duration: 0, type: 'warning' })
 		return data.data
 	},
 	(error) => {
 		elNotify({
-			message: error?.response?.data || String(error),
+			message: error?.response?.data?.msg || String(error),
 			duration: 0,
 			type: 'error'
 		})
@@ -67,7 +70,46 @@ request.interceptors.response.use(
 )
 
 export const requestListImages = (data: ImgReq): Promise<ImgList> => request.post('/rest/list', data)
-export const requestUploadImages = (data: FormData): Promise<ImgItem[]> => request.post('/rest/upload', data)
+export interface UploadBounds { maxFileBytes: number; maxBatchFiles: number; maxBatchBytes: number; deletionLinksEnabled: boolean }
+export const requestResourceConfig = (): Promise<UploadBounds> => request.get('/rest/settings/resource-config')
+export const requestResourceSettings = (): Promise<{ limits: ResourceLimits; usage: ResourceUsage }> => request.get('/rest/settings/resources')
+export const saveResourceSettings = (limits: ResourceLimits): Promise<ResourceLimits> => request.post('/rest/settings/resources', limits)
+export const cleanupResourceHistory = (): Promise<{ deleted: number; exhausted: boolean }> => request.post('/rest/settings/resources/cleanup')
+export const reconcileResourceUsage = (): Promise<{ checked: number; released: number; retained: number }> => request.post('/rest/settings/resources/reconcile')
+export interface ResourceUsage {
+    r2: { bytes: number; count: number }; uploads: { bytes: number; count: number };
+    statistics: { count: number }; cleanup: { count: number }; kvDeletes: { count: number }; user: { bytes: number; count: number };
+    pending: { bytes: number; count: number }; resetsAt: number
+}
+export const requestUploadImages = async (data: FormData): Promise<ImgItem[]> => {
+    const bounds = await requestResourceConfig()
+    const files = data.getAll('files') as File[]
+    if (files.some(file => !(file instanceof File) || file.size > bounds.maxFileBytes)) throw new Error('图片超过当前单张大小限制')
+    const batches = partitionFiles(files, bounds.maxBatchFiles, bounds.maxBatchBytes)
+    const results: ImgItem[] = []
+    let offset = 0
+    try {
+        for (const files of batches) {
+            const batch = new FormData()
+            for (const [key, value] of data.entries()) if (!['files', 'nsfw', 'nsfwScore'].includes(key)) batch.append(key, value)
+            files.forEach((file, index) => {
+                batch.append('files', file)
+                batch.append('nsfw', data.getAll('nsfw')[offset + index]?.toString() || 'false')
+                batch.append('nsfwScore', data.getAll('nsfwScore')[offset + index]?.toString() || '0')
+            })
+            const uploaded = await request.post<unknown, ImgItem[]>('/rest/upload', batch)
+            results.push(...uploaded)
+            offset += files.length
+            // Keep later files queued after a partial failure; do not hide successes or retry them.
+            if (uploaded.length !== files.length) break
+        }
+        return results
+    } catch (cause) {
+        const error = new Error(cause instanceof Error ? cause.message : String(cause)) as Error & { partialResults: ImgItem[] }
+        error.partialResults = results
+        throw error
+    }
+}
 export const createFolder = (data: Folder): Promise<any> => request.post('/rest/folder', data)
 // checkToken 返回类型：布尔值（JWT验证）或对象（Token登录成功）
 export interface TokenLoginResult {
@@ -82,7 +124,14 @@ export interface TokenLoginResult {
 	}
 }
 export const checkToken = (data: AuthToken): Promise<boolean | TokenLoginResult> => request.post('/rest/checkToken', data)
-export const requestDeleteImage = (data: ImgDel): Promise<string> => request.delete('/rest', { data })
+export const requestDeleteImage = async (data: ImgDel): Promise<string> => {
+    const { maxBatchFiles } = await requestResourceConfig()
+    const keys = [...new Set(data.keys.split(',').filter(Boolean))]
+    for (let index = 0; index < keys.length; index += maxBatchFiles) {
+        await request.delete('/rest', { data: { ...data, keys: keys.slice(index, index + maxBatchFiles).join(',') } })
+    }
+    return data.keys
+}
 export const requestRenameImage = (data: { oldKey: string, newKey: string }): Promise<string> => request.post('/rest/rename', data)
 export const requestUpdateImageTags = (data: { key: string, tags: string[] }): Promise<{ key: string, tags: string[] }> => request.post('/rest/updateTags', data)
 export const requestDelInfo = (token: string): Promise<ImgItem> => request.get(`/rest/delInfo/${token}`)

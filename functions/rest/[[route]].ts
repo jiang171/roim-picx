@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { handle } from 'hono/cloudflare-pages'
 import { cors } from 'hono/cors'
 import { Fail } from './type'
+import { resourceProtection } from './middleware/resources'
 import type { AppEnv } from './middleware/auth'
 
 // Import route modules
@@ -19,6 +20,7 @@ import { userMeHandler, userMeStatsHandler } from './routes/user'
 
 const app = new Hono<AppEnv>().basePath('/rest')
 app.use("*", cors())
+app.use('*', resourceProtection)
 // 注册明确的 user 路由（必须在 imageRoutes 的通配符路由之前）
 app.get('/user/me', userMeHandler)
 app.get('/user/me/stats', userMeStatsHandler)

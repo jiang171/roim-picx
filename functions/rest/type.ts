@@ -120,6 +120,7 @@ export interface DbUser {
 
 // D1 图片记录
 export interface DbImage {
+    delete_token: string | null
     id: number
     key: string
     user_id: number | null

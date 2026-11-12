@@ -7,6 +7,7 @@ import {
 } from '@fortawesome/free-solid-svg-icons'
 import BaseButton from '../common/BaseButton.vue'
 import BaseInput from '../common/BaseInput.vue'
+import AdminResources from './AdminResources.vue'
 import {
     requestGetUploadConfig, requestUpdateUploadConfig,
     requestGetTokenExpire, requestUpdateTokenExpire
@@ -151,4 +152,5 @@ defineExpose({
             <span class="text-xs text-gray-500">{{ $t('admin.tokenExpireHint') }}</span>
         </div>
     </el-card>
+    <AdminResources />
 </template>

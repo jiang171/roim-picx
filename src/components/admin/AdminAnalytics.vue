@@ -48,6 +48,7 @@ defineExpose({
 </script>
 
 <template>
+    <p class="mb-4 text-sm text-gray-500">{{ $i18n.locale.startsWith('zh') ? '访问数据按资源额度设置采样记录，达到当天预算后暂停记录，不代表完整访问量。' : 'Access data is sampled according to resource budgets and pauses at the daily limit; it is not a complete traffic count.' }}</p>
     <div>
         <div v-if="analyticsOverview" class="space-y-6">
             <!-- 访问统计 -->

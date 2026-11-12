@@ -1,11 +1,12 @@
 import { Hono } from 'hono'
 import type { R2ListOptions, D1Database } from '@cloudflare/workers-types'
-import { Ok, Fail, ImgItem, ImgList, ImgReq } from '../type'
+import { Ok, Fail, FailCode, ImgItem, ImgList, ImgReq } from '../type'
 import type { User, DbImage } from '../type'
 import { parseRange } from '../utils'
 import { auth, type AppEnv } from '../middleware/auth'
 import { listRateLimit } from '../middleware/rateLimit'
 import { getProviderByType, getStorageProvider } from '../storage'
+import { getResourceLimits, reserveUpload, releaseUpload, resourceError, recordImageAccess, cleanupDeletionToken, scheduleHistoryCleanup } from '../services/ResourceService'
 
 const imageRoutes = new Hono<AppEnv>()
 
@@ -30,7 +31,7 @@ imageRoutes.post('/list', listRateLimit, auth, async (c) => {
     const viewAll = canViewAllImages(user, isAdminToken)
 
     const data = await c.req.json<ImgReq>()
-    if (!data.limit) {
+    if (!Number.isSafeInteger(data.limit) || data.limit < 1) {
         data.limit = 10
     }
     if (data.limit > 100) {
@@ -228,11 +229,15 @@ imageRoutes.post('/updateTags', auth, async (c) => {
 
 // 重命名文件
 imageRoutes.post('/rename', auth, async (c) => {
+    let reservedKey: string | undefined
+    let copyWritten = false
     try {
         const data = await c.req.json<{ oldKey: string, newKey: string }>()
         if (!data.oldKey || !data.newKey) {
             return c.json(Fail("Missing oldKey or newKey"))
         }
+        if (data.oldKey === data.newKey) return c.json(Ok(data))
+        if (new TextEncoder().encode(data.newKey).length > 512) return c.json(Fail('新图片路径不能超过 512 UTF-8 字节'))
 
         // 获取图片详情以确定存储方式
         const img = await c.env.DB.prepare('SELECT * FROM images WHERE key = ?')
@@ -243,8 +248,13 @@ imageRoutes.post('/rename', auth, async (c) => {
         }
 
         const provider = getProviderByType(c, img.storage_type || 'R2')
+        if (await provider.head(data.newKey)) return c.json(Fail('目标文件已存在'))
+        await reserveUpload(c.env.DB, data.newKey, img.user_login, img.size, img.storage_type || 'R2')
+        reservedKey = data.newKey
         const oldObject = await provider.get(data.oldKey)
         if (!oldObject) {
+            await releaseUpload(c.env.DB, data.newKey)
+            reservedKey = undefined
             return c.json(Fail("File not found in storage"))
         }
 
@@ -253,17 +263,21 @@ imageRoutes.post('/rename', auth, async (c) => {
             contentType: oldObject.contentType!,
             metadata: oldObject.metadata,
         })
+        copyWritten = true
 
         // Delete old file
         await provider.delete(data.oldKey)
 
         // 同步更新 D1 数据库
-        c.executionCtx.waitUntil(
-            c.env.DB.prepare('UPDATE images SET key = ? WHERE key = ?')
-                .bind(data.newKey, data.oldKey)
-                .run()
-                .catch(e => console.error('Failed to update image key in DB:', e))
-        )
+        const deleteToken = img.delete_token || oldObject.metadata?.delToken
+        await c.env.DB.prepare('UPDATE images SET key = ?, delete_token = ? WHERE key = ?')
+            .bind(data.newKey, deleteToken || null, data.oldKey).run()
+        reservedKey = undefined
+        if (deleteToken) {
+            const limits = c.get('resourceLimits') || await getResourceLimits(c.env.DB)
+            await c.env.XK.put(`del:${deleteToken}`, data.newKey,
+                limits.deletionTokenTtlDays > 0 ? { expirationTtl: limits.deletionTokenTtlDays * 86400 } : undefined)
+        }
 
         // 记录审计日志
         const user = c.get('user') as User | undefined
@@ -283,35 +297,43 @@ imageRoutes.post('/rename', auth, async (c) => {
 
         return c.json(Ok({ oldKey: data.oldKey, newKey: data.newKey }))
     } catch (e) {
-        return c.json(Fail(`Rename failed: ${(e as Error).message}`))
+        // A copy that may exist keeps its reservation until it can be reconciled.
+        if (reservedKey && !copyWritten) console.error('Rename interrupted; retaining reservation for reconciliation:', reservedKey)
+        return c.json(Fail(`Rename failed: ${resourceError(e)}`))
     }
 })
 
 /**
  * 从 D1 删除图片记录并更新用户统计
  */
-async function deleteImageFromDb(c: any, key: string): Promise<void> {
+async function deleteImageFromDb(c: import('hono').Context<AppEnv>, key: string, expectedToken?: string): Promise<void> {
     try {
         const db = c.env.DB
         // 获取图片信息用于更新用户统计
-        const image = await db.prepare('SELECT user_login, size, storage_type FROM images WHERE key = ?')
-            .bind(key).first<{ user_login: string, size: number, storage_type: string }>()
+        const image = await db.prepare(`SELECT user_login, size, storage_type, delete_token FROM images WHERE key = ?
+            UNION ALL SELECT user_login, size, storage_type, NULL AS delete_token FROM resource_reservations
+            WHERE key = ? AND NOT EXISTS (SELECT 1 FROM images WHERE key = ?)`)
+            .bind(key, key, key).first<{ user_login: string, size: number, storage_type: 'R2' | 'HF', delete_token: string | null }>()
 
         if (image) {
             // 从物理存储删除
             const provider = getProviderByType(c, (image.storage_type as any) || 'R2')
+            const token = image.delete_token || (await provider.head(key))?.metadata?.delToken
+            if (expectedToken && token !== expectedToken) throw new Error('Invalid or expired deletion link')
             await provider.delete(key)
 
             // 删除图片记录
-            await db.prepare('DELETE FROM images WHERE key = ?').bind(key).run()
-
-            // 更新用户存储统计
-            await db.prepare(
-                'UPDATE users SET storage_used = MAX(0, storage_used - ?) WHERE login = ?'
-            ).bind(image.size, image.user_login).run()
-        }
+            await db.batch([
+                db.prepare(`UPDATE users SET storage_used = MAX(0, storage_used - ?) WHERE login = ?
+                    AND EXISTS (SELECT 1 FROM images WHERE key = ?)` ).bind(image.size, image.user_login, key),
+                db.prepare('DELETE FROM images WHERE key = ?').bind(key),
+                db.prepare('DELETE FROM resource_reservations WHERE key = ?').bind(key)
+            ])
+            if (token) await cleanupDeletionToken(c.env.DB, c.env.XK, token)
+        } else if (expectedToken) await cleanupDeletionToken(c.env.DB, c.env.XK, expectedToken)
     } catch (e) {
         console.error('Failed to delete image from DB/Storage:', e)
+        throw e
     }
 }
 
@@ -333,7 +355,9 @@ imageRoutes.delete("/", auth, async (c) => {
     if (!keys || keys.length < 1) {
         return c.json(Fail("not delete keys"))
     }
-    const arr = keys.split(',')
+    const arr = [...new Set(keys.split(',').filter(Boolean))]
+    const limits = c.get('resourceLimits') || await getResourceLimits(c.env.DB)
+    if (arr.length > limits.maxBatchFiles) return c.json(FailCode(`每批最多删除 ${limits.maxBatchFiles} 张，请分批操作`, 413), 413)
     const user = c.get('user') as User | undefined
 
     try {
@@ -382,6 +406,7 @@ imageRoutes.get('/delInfo/:token', async (c) => {
     if (!object) {
         return c.json(Fail("Image not found in storage"))
     }
+    if ((img.delete_token || object.metadata?.delToken) !== token) return c.json(Fail('Invalid or expired deletion link'))
 
     return c.json(Ok({
         key: key,
@@ -403,8 +428,7 @@ imageRoutes.post('/delImage/:token', async (c) => {
     }
 
     try {
-        await deleteImageFromDb(c, key)
-        await c.env.XK.delete(`del:${token}`)
+        await deleteImageFromDb(c, key, token)
         return c.json(Ok("Delete success"))
     } catch (e) {
         return c.json(Fail(`Delete failed: ${(e as Error).message}`))
@@ -440,6 +464,8 @@ imageRoutes.get("/:id{.+}", async (c) => {
     if (object == null) {
         return c.json(Fail("object not found in storage"), 404)
     }
+    const resourceLimits = c.get('resourceLimits') || await getResourceLimits(c.env.DB)
+    scheduleHistoryCleanup(c.env.DB, resourceLimits, promise => c.executionCtx.waitUntil(promise))
 
     // Check for expiration
     if (img.expires_at) {
@@ -459,14 +485,8 @@ imageRoutes.get("/:id{.+}", async (c) => {
             const country = cf?.country || null
             const city = cf?.city || null
 
-            await c.env.DB.prepare(
-                `INSERT INTO image_stats (image_key, referer, user_agent, country, city) 
-                 VALUES (?, ?, ?, ?, ?)`
-            ).bind(id, referer, userAgent, country, city).run()
-
-            await c.env.DB.prepare(
-                'UPDATE images SET view_count = view_count + 1 WHERE key = ?'
-            ).bind(id).run()
+            const limits = c.get('resourceLimits') || await getResourceLimits(c.env.DB)
+            await recordImageAccess(c.env.DB, limits, { key: id, referer, userAgent, country, city })
         } catch (e) {
             console.error('Failed to record image stats:', e)
         }
