@@ -210,16 +210,14 @@ sequenceDiagram
 
 ### 8️⃣ 数据库迁移
 
-在本地环境执行以下命令将初始表结构导入到 D1：
+先在本机 Wrangler 配置中填写自己的 D1 数据库名称、ID 和 `migrations_dir = "migrations"`，再执行全部待处理迁移。首次部署和后续升级均使用迁移管理器；仅导入 `0001_init.sql` 无法满足当前版本。
 
 ```bash
-npx wrangler d1 execute <YOUR_DATABASE_NAME> --remote --file=./migrations/0001_init.sql
-
-首次升级可以使用命令进行数据库初始化
-
-```bash
-wrangler d1 migrations apply <YOUR_DATABASE_NAME> --remote
+npx wrangler d1 migrations apply <YOUR_DATABASE_NAME> --remote --config <YOUR_WRANGLER_CONFIG>
+npx wrangler d1 migrations list <YOUR_DATABASE_NAME> --remote --config <YOUR_WRANGLER_CONFIG>
 ```
+
+确认没有待处理迁移后再部署新代码。账户专用配置文件请保存在本机，勿提交到公开仓库。
 
 在部署 Cloudflare Pages 时，需要在 **Settings -> Variables and Secrets** 中配置以下环境变量：
 
