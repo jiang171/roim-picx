@@ -1,6 +1,6 @@
 # 资源额度控制
 
-管理后台 → 系统设置 → **资源额度**，可查看本项目的计数、修改阈值和执行分批清理。GET 删除、删除链接和访问统计默认开启，原有接口路径不变。图片仍使用现有 `/rest/图片Key` 地址。
+管理后台 → 系统设置 → **资源额度**，可查看本项目的计数、修改阈值和执行分批清理。GET 删除、删除链接和访问统计默认开启，原有接口路径不变。GET 删除需要管理凭证，图片仍使用现有 `/rest/图片Key` 地址公开访问。
 
 ## 上线顺序
 
@@ -55,10 +55,26 @@
 - 后端检查真实请求体长度、每张大小、整批大小和数量，不依赖浏览器检查或客户端声明的 `Content-Length`。
 - `POST /rest/upload` 仍使用 `files` 等原有字段，返回原有 `code/msg/data` 结构；超限返回 413 或 429，并给出原因。
 - 外部调用方需自行分批上传。`GET /rest/settings/resource-config` 公开返回 `maxFileBytes/maxBatchFiles/maxBatchBytes/deletionLinksEnabled`。
-- 批量 DELETE 每批也最多 `maxBatchFiles` 个 Key；网页会自动分批。原 `GET /rest/del/:key` 删除接口继续默认公开启用。
+- 批量 DELETE 每批也最多 `maxBatchFiles` 个 Key；网页会自动分批。原 `GET /rest/del/:key` 路径继续启用，但必须提供有效的登录 Token 或 API Key，并通过所有者/管理员权限检查。只有图片 Key 的匿名请求会被拒绝。
 - 关闭“删除链接”会暂停 `/rest/delInfo/:token`、`/rest/delImage/:token`，并停止给新上传写 KV Token。原有 KV 记录保留，重新开启后仍可使用，后台删除及 GET 删除不受该开关影响。
 - 修改删除链接有效期只作用于新写入/重命名更新的 Token，不会扫描重写已有 KV 数据。
 - 管理员设置接口：`GET/POST /rest/settings/resources`；分批清理：`POST /rest/settings/resources/cleanup`；预留核对：`POST /rest/settings/resources/reconcile`。均要求管理员认证。
+
+## 接口认证
+
+上传、列表、重命名、标签修改、文件夹/相册管理和分享管理均要求认证。后台设置还要求管理员权限。GET 删除及批量 DELETE 统一检查管理凭证和资源归属；图片地址中的 Key 不是管理凭证。
+
+网页登录后会自动携带凭证。脚本调用可以使用：
+
+```http
+Authorization: Bearer <登录Token或API-Key>
+```
+
+API Key 也支持 `X-API-Key: <API-Key>`，当前授权范围为上传、图片列表、GET 删除和批量 DELETE；重命名及管理设置使用登录 Token。API Key 可在后台创建、设置过期时间或撤销。新 Key 使用密码学安全随机数，既有 Key 格式继续兼容。
+
+`GET /rest/delInfo/:token` 和 `POST /rest/delImage/:token` 使用独立的随机删除 Token 作为凭证，保留可点击删除链接的原有流程。拿到此私密链接的人具备删除对应图片的权限，应妥善保管。图片浏览、分享访问及登录入口仍保持公开。
+
+从旧版本升级后，仅传 Key、不带凭证的 GET 删除调用需要补上认证请求头。未认证响应沿用项目的 `code: 401` JSON 结构，不要只根据 HTTP 状态码判断成功。
 
 ## 访问统计和历史清理
 

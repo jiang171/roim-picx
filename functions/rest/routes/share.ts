@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
-import { Ok, Fail, type DbShare } from '../type'
-import { auth, type AppEnv } from '../middleware/auth'
+import { Ok, Fail, FailCode, type DbShare } from '../type'
+import { auth, canManageResource, type AppEnv } from '../middleware/auth'
 import { getProviderByType } from '../storage'
 
 // Sync the response format with previous KV implementation for compatibility
@@ -57,13 +57,14 @@ shareRoutes.post('/share', auth, async (c) => {
         }
 
         // Verify image exists in DB (multi-storage)
-        const img = await c.env.DB.prepare('SELECT key, storage_type, expires_at FROM images WHERE key = ?')
+        const img = await c.env.DB.prepare('SELECT key, user_login, storage_type, expires_at FROM images WHERE key = ?')
             .bind(data.imageKey)
-            .first<{ key: string, storage_type?: 'R2' | 'HF', expires_at?: string | null }>()
+            .first<{ key: string, user_login: string, storage_type?: 'R2' | 'HF', expires_at?: string | null }>()
 
         if (!img) {
             return c.json(Fail('图片不存在'))
         }
+        if (!canManageResource(c, img.user_login)) return c.json(FailCode('无权限分享此图片', 403), 403)
 
         // Check expiration if set
         if (img.expires_at) {
@@ -265,9 +266,13 @@ shareRoutes.post('/share/:id/verify', async (c) => {
 shareRoutes.delete('/share/:id', auth, async (c) => {
     const shareId = c.req.param('id')
 
+    const share = await c.env.DB.prepare('SELECT user_login FROM shares WHERE id = ?')
+        .bind(shareId).first<{ user_login: string | null }>()
+    if (share && !canManageResource(c, share.user_login || '')) return c.json(FailCode('无权限删除此分享', 403), 403)
+
     const result = await c.env.DB.prepare(
-        'DELETE FROM shares WHERE id = ?'
-    ).bind(shareId).run()
+        'DELETE FROM shares WHERE id = ? AND (user_login = ? OR ? = 1)'
+    ).bind(shareId, c.get('user')?.login || '', canManageResource(c, '') ? 1 : 0).run()
 
     if (result.meta.changes === 0) {
         return c.json(Fail('分享链接不存在'), 200)

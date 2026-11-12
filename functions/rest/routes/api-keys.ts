@@ -30,8 +30,9 @@ apiKeyRoutes.post('/api-keys', auth, async (c) => {
         if (!name) return c.json(Fail('Name is required'))
 
         // Generate a random key
-        const prefix = Math.random().toString(36).substring(2, 10)
-        const secret = Math.random().toString(36).substring(2) + Math.random().toString(36).substring(2)
+        const randomHex = (length: number) => Array.from(crypto.getRandomValues(new Uint8Array(length)), byte => byte.toString(16).padStart(2, '0')).join('')
+        const prefix = randomHex(8)
+        const secret = randomHex(32)
         const fullKey = `px_${prefix}.${secret}`
 
         // Hash the secret

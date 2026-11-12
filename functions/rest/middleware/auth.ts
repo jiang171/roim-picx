@@ -38,6 +38,11 @@ export type Variables = {
 
 export type AppEnv = { Bindings: Bindings; Variables: Variables }
 
+export function canManageResource(c: Context<AppEnv>, owner: string): boolean {
+    const user = c.get('user')
+    return c.get('isAdminToken') === true || !!user && (user.role === 'admin' || user.login === owner)
+}
+
 /**
  * 检查用户是否是超级管理员
  */
@@ -276,6 +281,7 @@ export const auth = async (c: Context<AppEnv>, next: Next) => {
                 { path: '/rest/upload', method: 'POST' },
                 { path: '/rest/list', method: 'POST' },
                 { path: '/rest/', method: 'DELETE' }, // Batch delete
+                { path: '/rest', method: 'DELETE' },
                 { path: '/rest/checkToken', method: 'GET' }
             ]
 

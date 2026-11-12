@@ -5,7 +5,7 @@ import { readFileSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 
 const bundled = await build({
     stdin: { contents: `export { app } from './functions/rest/[[route]].ts';
@@ -201,13 +201,15 @@ test('asynchronous metadata failure cannot bypass storage quota', async () => {
     assert.equal((await upload(f)).response.status, 429)
 })
 
-test('GET deletion remains public and removes its KV token; failed deletion retains capacity', async () => {
+test('GET deletion requires credentials, removes its KV token, and retains capacity after storage failure', async () => {
     const f = fixture(); const { data } = await upload(f); const image = data.data[0]
+    const anonymous = await f.request(`/del/${image.key}`, { auth: false }); await f.flush()
+    assert.equal((await anonymous.json()).code, 401); assert.ok(f.bucket.objects.has(image.key))
     f.bucket.failDelete = true
-    await f.request(`/del/${image.key}`, { auth: false }); await f.flush()
+    await f.request(`/del/${image.key}`); await f.flush()
     assert.equal(usage(f).bytes, 4)
     f.bucket.failDelete = false
-    const response = await f.request(`/del/${image.key}`, { auth: false }); await f.flush()
+    const response = await f.request(`/del/${image.key}`); await f.flush()
     assert.equal(response.status, 200); assert.equal(usage(f).bytes, 0); assert.equal(f.kv.items.size, 0)
 })
 
@@ -217,7 +219,7 @@ test('deletion links default on; disabling them skips KV writes and preserves GE
     const { data } = await upload(f)
     assert.equal(f.kv.putCount, 0); assert.equal(data.data[0].delToken, undefined)
     assert.equal((await f.request('/delInfo/anything', { auth: false })).status, 403)
-    assert.equal((await f.request(`/del/${data.data[0].key}`, { auth: false })).status, 200)
+    assert.equal((await f.request(`/del/${data.data[0].key}`)).status, 200)
     await f.flush(); assert.equal(usage(f).bytes, 0)
 })
 
@@ -299,7 +301,7 @@ test('KV cleanup has an atomic daily budget and retains its queue for later', as
 test('queued old deletion tokens cannot delete a new image with the same key', async () => {
     const f = fixture(); await f.limits({ dailyKvDeletes: 0 })
     const first = (await upload(f, [4], { keepName: true })).data.data[0]
-    await f.request(`/del/${first.key}`, { auth: false }); await f.flush()
+    await f.request(`/del/${first.key}`); await f.flush()
     assert.ok(f.kv.items.has(`del:${first.delToken}`))
     const second = (await upload(f, [4], { keepName: true })).data.data[0]
     const response = await f.request(`/delImage/${first.delToken}`, { auth: false, method: 'POST' })
@@ -349,4 +351,80 @@ test('long image keys are rejected before writing storage', async () => {
     const f = fixture(); const form = f.form([4]); form.set('path', '中'.repeat(200))
     const response = await f.request('/upload', { method: 'POST', body: form })
     assert.equal(response.status, 400); assert.equal(f.bucket.objects.size, 0)
+})
+
+function userJwt(f, login) {
+    const user = f.db.sql.prepare('SELECT id FROM users WHERE login = ?').get(login)
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url')
+    const payload = Buffer.from(JSON.stringify({ id: user.id, login, name: login, exp: Math.floor(Date.now() / 1000) + 600 })).toString('base64url')
+    const signature = createHmac('sha256', f.env.PICX_AUTH_TOKEN).update(`${header}.${payload}`).digest('base64url')
+    return `${header}.${payload}.${signature}`
+}
+
+test('unauthenticated and invalid credentials cannot upload, rename, or delete', async () => {
+    const f = fixture(); const image = (await upload(f)).data.data[0]
+    for (const headers of [{}, { Authorization: 'invalid-token' }, { 'X-API-Key': 'px_missing.invalid' }]) {
+        const cases = [
+            ['/upload', 'POST', f.form()],
+            ['/rename', 'POST', JSON.stringify({ oldKey: image.key, newKey: 'blocked.png' })],
+            [`/del/${image.key}`, 'GET', undefined],
+            ['', 'DELETE', JSON.stringify({ keys: image.key })]
+        ]
+        for (const [path, method, body] of cases) {
+            const result = await f.request(path, { method, body, headers, auth: false })
+            assert.equal((await result.json()).code, 401)
+        }
+    }
+    await f.flush()
+    assert.equal(f.bucket.objects.size, 1); assert.ok(f.bucket.objects.has(image.key))
+})
+
+test('JWT owners can use GET deletion but other users cannot modify their resources', async () => {
+    const f = fixture()
+    f.db.sql.exec("INSERT INTO users(github_id,login,role,storage_quota) VALUES(11,'alice','user',1000),(12,'bob','user',1000)")
+    const alice = { Authorization: userJwt(f, 'alice') }, bob = { Authorization: userJwt(f, 'bob') }
+    const uploaded = await f.request('/upload', { method: 'POST', body: f.form(), headers: alice })
+    const image = (await uploaded.json()).data[0]; await f.flush()
+    const shareResponse = await f.request('/share', { method: 'POST', headers: alice, body: JSON.stringify({ imageKey: image.key, imageUrl: image.url }) })
+    const share = (await shareResponse.json()).data; await f.flush()
+    for (const [path, method, body] of [
+        [`/del/${image.key}`, 'GET', undefined],
+        ['', 'DELETE', JSON.stringify({ keys: image.key })],
+        ['/rename', 'POST', JSON.stringify({ oldKey: image.key, newKey: 'blocked.png' })],
+        ['/share', 'POST', JSON.stringify({ imageKey: image.key, imageUrl: image.url })],
+        [`/share/${share.id}`, 'DELETE', undefined]
+    ]) {
+        const response = await f.request(path, { method, body, headers: bob })
+        assert.equal(response.status, 403)
+    }
+    await f.flush(); assert.ok(f.bucket.objects.has(image.key))
+    assert.ok(f.db.sql.prepare('SELECT id FROM shares WHERE id = ?').get(share.id))
+    const deleted = await f.request(`/del/${image.key}`, { headers: alice }); assert.equal((await deleted.json()).code, 200)
+    await f.flush(); assert.equal(f.bucket.objects.size, 0)
+})
+
+test('cryptographic API keys support upload, GET deletion, root DELETE, expiry, and revocation', async () => {
+    const f = fixture()
+    const response = await f.request('/api-keys', { method: 'POST', body: JSON.stringify({ name: 'integration' }) })
+    const key = (await response.json()).data
+    assert.match(key.key, /^px_[a-f0-9]{16}\.[a-f0-9]{64}$/)
+    const headers = { 'X-API-Key': key.key }
+    const r = await f.request('/upload', { method: 'POST', auth: false, headers, body: f.form([1, 1]) })
+    const images = (await r.json()).data; assert.equal(images.length, 2); await f.flush()
+    assert.equal((await (await f.request(`/del/${images[0].key}`, { auth: false, headers })).json()).code, 200)
+    assert.equal((await (await f.request('', { method: 'DELETE', auth: false, headers, body: JSON.stringify({ keys: images[1].key }) })).json()).code, 200)
+    await f.flush(); assert.equal(f.bucket.objects.size, 0)
+    f.db.sql.prepare('UPDATE api_keys SET expires_at = ? WHERE id = ?').run('2000-01-01T00:00:00Z', key.id)
+    assert.equal((await (await f.request('/del/anything', { auth: false, headers })).json()).code, 401)
+    await f.request(`/api-keys/${key.id}`, { method: 'DELETE' })
+    assert.equal((await (await f.request('/del/anything', { auth: false, headers })).json()).code, 401)
+})
+
+test('a private deletion token remains a supported credential without a login session', async () => {
+    const f = fixture(); const image = (await upload(f)).data.data[0]
+    const info = await f.request(`/delInfo/${image.delToken}`, { auth: false })
+    assert.equal((await info.json()).code, 200)
+    const deleted = await f.request(`/delImage/${image.delToken}`, { method: 'POST', auth: false })
+    assert.equal((await deleted.json()).code, 200); assert.equal(f.bucket.objects.size, 0)
+    const raw = await f.request(`/${image.key}`, { auth: false }); assert.equal(raw.status, 404)
 })

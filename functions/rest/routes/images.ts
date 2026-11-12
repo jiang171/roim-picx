@@ -3,7 +3,7 @@ import type { R2ListOptions, D1Database } from '@cloudflare/workers-types'
 import { Ok, Fail, FailCode, ImgItem, ImgList, ImgReq } from '../type'
 import type { User, DbImage } from '../type'
 import { parseRange } from '../utils'
-import { auth, type AppEnv } from '../middleware/auth'
+import { auth, canManageResource, type AppEnv } from '../middleware/auth'
 import { listRateLimit } from '../middleware/rateLimit'
 import { getProviderByType, getStorageProvider } from '../storage'
 import { getResourceLimits, reserveUpload, releaseUpload, resourceError, recordImageAccess, cleanupDeletionToken, scheduleHistoryCleanup } from '../services/ResourceService'
@@ -246,6 +246,7 @@ imageRoutes.post('/rename', auth, async (c) => {
         if (!img) {
             return c.json(Fail("Image not found in DB"))
         }
+        if (!canManageResource(c, img.user_login)) return c.json(FailCode('无权限修改此图片', 403), 403)
 
         const provider = getProviderByType(c, img.storage_type || 'R2')
         if (await provider.head(data.newKey)) return c.json(Fail('目标文件已存在'))
@@ -306,7 +307,7 @@ imageRoutes.post('/rename', auth, async (c) => {
 /**
  * 从 D1 删除图片记录并更新用户统计
  */
-async function deleteImageFromDb(c: import('hono').Context<AppEnv>, key: string, expectedToken?: string): Promise<void> {
+async function deleteImageFromDb(c: import('hono').Context<AppEnv>, key: string, expectedToken?: string, checkOwner = false): Promise<void> {
     try {
         const db = c.env.DB
         // 获取图片信息用于更新用户统计
@@ -316,6 +317,7 @@ async function deleteImageFromDb(c: import('hono').Context<AppEnv>, key: string,
             .bind(key, key, key).first<{ user_login: string, size: number, storage_type: 'R2' | 'HF', delete_token: string | null }>()
 
         if (image) {
+            if (checkOwner && !canManageResource(c, image.user_login)) throw new Error('无权限删除此图片')
             // 从物理存储删除
             const provider = getProviderByType(c, (image.storage_type as any) || 'R2')
             const token = image.delete_token || (await provider.head(key))?.metadata?.delToken
@@ -337,14 +339,24 @@ async function deleteImageFromDb(c: import('hono').Context<AppEnv>, key: string,
     }
 }
 
-// 删除key (GET方式，保持兼容)
-imageRoutes.get('/del/:id{.+}', async (c) => {
+async function canDeleteImages(c: import('hono').Context<AppEnv>, keys: string[]): Promise<boolean> {
+    const user = c.get('user')
+    if (!user) return false
+    if (canManageResource(c, '')) return true
+    const result = await c.env.DB.prepare(`SELECT user_login FROM images WHERE key IN (SELECT value FROM json_each(?))
+        UNION ALL SELECT user_login FROM resource_reservations WHERE key IN (SELECT value FROM json_each(?))`)
+        .bind(JSON.stringify(keys), JSON.stringify(keys)).all<{ user_login: string }>()
+    return result.results.every(image => canManageResource(c, image.user_login))
+}
+
+// Keep the GET path, but require the same credentials as other management APIs.
+imageRoutes.get('/del/:id{.+}', auth, async (c) => {
     const key = c.req.param('id')
     if (!key) {
         return c.json(Fail("not delete key"))
     }
-    // 同步删除 D1 记录和物理文件
-    c.executionCtx.waitUntil(deleteImageFromDb(c, key))
+    if (!await canDeleteImages(c, [key])) return c.json(FailCode('无权限删除此图片', 403), 403)
+    c.executionCtx.waitUntil(deleteImageFromDb(c, key, undefined, true))
     return c.json(Ok(key))
 })
 
@@ -358,13 +370,14 @@ imageRoutes.delete("/", auth, async (c) => {
     const arr = [...new Set(keys.split(',').filter(Boolean))]
     const limits = c.get('resourceLimits') || await getResourceLimits(c.env.DB)
     if (arr.length > limits.maxBatchFiles) return c.json(FailCode(`每批最多删除 ${limits.maxBatchFiles} 张，请分批操作`, 413), 413)
+    if (!await canDeleteImages(c, arr)) return c.json(FailCode('无权限删除所选图片', 403), 403)
     const user = c.get('user') as User | undefined
 
     try {
         for (let it of arr) {
             if (it && it.length) {
                 // 同步删除 D1 记录和物理文件
-                c.executionCtx.waitUntil(deleteImageFromDb(c, it))
+                c.executionCtx.waitUntil(deleteImageFromDb(c, it, undefined, true))
 
                 // 记录审计日志
                 if (user) {
